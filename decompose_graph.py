@@ -3,8 +3,23 @@ import re
 
 def decompose_claim_to_graph(client, claim: str) -> dict:
     prompt = f"""
-Decompose this faithful claim into a reasoning graph JSON with 'nodes' (entities/values) and 'edges' (relationships/trends).
+Decompose this faithful claim into a strict reasoning graph JSON.
+
+You MUST use the following JSON schema exactly:
+{{
+  "nodes": [
+    {{"id": "string", "type": "string", "value": "string"}}
+  ],
+  "edges": [
+    {{"source": "node_id", "target": "node_id", "relation": "string", "metric": "string"}}
+  ]
+}}
+
+Crucially, any comparisons between two entities MUST be represented as a directional edge with a clear `relation` and the `metric` being compared. Furthermore, DO NOT extract metrics as separate standalone nodes; metrics should ONLY exist within the `metric` property of an edge comparing two actual entities.
+
 Claim: {claim}
+
+Output only the JSON block.
 """
     llm_response = client.chat.completions.create(
         messages=[

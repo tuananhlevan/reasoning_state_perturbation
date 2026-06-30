@@ -4,9 +4,11 @@ import re
 def mutate_claim_graph(client, original_graph: dict) -> dict:
     prompt = f"""
 You are an expert logician and data manipulator.
-Given the following reasoning graph (represented as JSON with 'nodes' and 'edges'), your goal is to deliberately mutate it to introduce a logical CONTRADICTION with its original meaning.
+Given the following strict JSON reasoning graph, your goal is to deliberately mutate it to introduce a strong logical CONTRADICTION with its original meaning.
 
-You should alter the graph by targeting one or more of the following reasoning concepts:
+Crucially, the graph contains directional edges representing comparisons or relationships. You MUST mutate the `relation` field of the edges to create a mathematical or logical opposite (e.g., if the relation is "better_than", flip it to "worse_than"). DO NOT just swap node names; explicitly change the relationship logic.
+
+You should alter the graph by targeting one or more of the following reasoning concepts when flipping the relations:
 - Maximum
 - Minimum
 - Ranking
