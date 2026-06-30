@@ -15,7 +15,8 @@ def main():
     # 2. Extract table data
     print("Extracting table data from image...")
     table_data = extract_table_from_image(client, encoded_img)
-    # print(table_data)
+    print(table_data)
+    print("------------------------------")
     
     faithful_reference_paragraph = "\\input{tables/diffusion_hr_main} Apart from ImageNet 512$\\times$512, we also test our models for higher-resolution image generation. As shown in Table~\\ref{tab:diffusion_hr_main}, we have a similar finding where \\modelshort-f32p1 achieves better FID than SD-VAE-f8p2 for all cases."
 

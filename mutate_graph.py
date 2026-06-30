@@ -7,17 +7,26 @@ You are an expert logician and data manipulator.
 Given the following reasoning graph (represented as JSON with 'nodes' and 'edges'), your goal is to deliberately mutate it to introduce a logical CONTRADICTION with its original meaning.
 
 You should alter the graph by targeting one or more of the following reasoning concepts:
-- Comparison (e.g., flip 'greater than' to 'less than')
-- Aggregation (e.g., change 'total' to 'average', or modify sum)
-- Ranking (e.g., swap 'best' to 'worst', or change ordinal position)
-- Trend (e.g., reverse 'increasing' to 'decreasing')
-- Statistical significance (e.g., change 'significant' to 'insignificant')
-- Correlation (e.g., change 'positive correlation' to 'negative correlation')
-- Causation (e.g., flip cause and effect)
-- Temporal ordering (e.g., swap 'before' and 'after')
-- Generalization (e.g., change 'all' to 'some' or 'none')
-- Exception (e.g., introduce or remove an exception)
-- Uncertainty (e.g., change 'certain' to 'unlikely')
+- Maximum
+- Minimum
+- Ranking
+- Average
+- Variance
+- Trend
+- Plateau
+- Acceleration
+- Correlation
+- Causation
+- Generalization
+- Exception
+- Statistical significance
+- Confidence
+- Interaction
+- Tradeoff
+- Ablation
+- Sensitivity
+- Consistency
+- Robustness
 
 Original Graph:
 {json.dumps(original_graph, indent=2)}
