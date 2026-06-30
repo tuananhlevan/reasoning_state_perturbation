@@ -17,32 +17,32 @@ def main():
     table_data = extract_table_from_image(client, encoded_img)
     # print(table_data)
     
-    faithful_reference_paragraph = "We conduct ablation study experiments and summarize the results in Table~\\ref{tab:diffusion_ablation_vae_patchsize}. We can see that directly reaching the target spatial compression ratio with the autoencoder gives the best results among all settings. In addition, we also find that shifting the spatial compression ratio from the diffusion model to the autoencoder consistently leads to better FID."
+    faithful_reference_paragraph = "\\input{tables/diffusion_hr_main} Apart from ImageNet 512$\\times$512, we also test our models for higher-resolution image generation. As shown in Table~\\ref{tab:diffusion_hr_main}, we have a similar finding where \\modelshort-f32p1 achieves better FID than SD-VAE-f8p2 for all cases."
 
     # 2.5 Generate terminology mapping (Generalizable context)
-    print("Generating terminology mapping...")
+    print("\nGenerating terminology mapping...")
     domain_context = generate_terminology_mapping(client, faithful_reference_paragraph, table_data)
     print("--- Dynamic Domain Context ---")
     print(domain_context)
     print("------------------------------")
 
     # 3. Decompose claim to graph
-    print("Decomposing claim to graph...")
+    print("\nDecomposing claim to graph...")
     claim_graph = decompose_claim_to_graph(client, faithful_reference_paragraph)
     print("Claim graph:", claim_graph)
     
     # 3.5 Mutate graph
-    print("Mutating claim graph to introduce contradiction...")
+    print("\nMutating claim graph to introduce contradiction...")
     mutated_claim_graph = mutate_claim_graph(client, claim_graph)
     print("Mutated claim graph:", mutated_claim_graph)
     
     # 4. Verbalize mutated graph to claim
-    print("Verbalizing mutated graph...")
+    print("\nVerbalizing mutated graph...")
     counterfactual_claim = verbalize_graph_to_claim(client, mutated_claim_graph)
     print("Counterfactual claim:", counterfactual_claim)
     
     # 5. Verify contradiction
-    print("Verifying contradiction...")
+    print("\nVerifying contradiction...")
     is_contradiction = verify_contradiction(client, encoded_img, counterfactual_claim, domain_context, table_data)
     print("Is contradiction:", is_contradiction)
 
