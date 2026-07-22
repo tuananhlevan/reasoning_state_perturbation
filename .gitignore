@@ -1,5 +1,11 @@
 __pycache__
 .codegraph
+.codex
+.agents
 .env
 test/
-*.jpg
+.vscode
+prompts/
+outputs/
+credentials.json
+.work/
