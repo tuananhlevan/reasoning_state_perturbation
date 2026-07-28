@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Discover or download one unprocessed Drive archive."""
-import argparse, hashlib, json, re
+import argparse, hashlib, json, os, re
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from authenticate import get_credentials, load_env
 FOLDER_MIME = "application/vnd.google-apps.folder"
 ARCHIVE_SUFFIXES = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")
-ARTIFACT_VERSION = "2"
+ARTIFACT_VERSION = "4"
 
 def folder_id(value):
     parsed = urlparse(value); ids = parse_qs(parsed.query).get("id", [])
@@ -18,7 +18,10 @@ def folder_id(value):
 
 def service():
     from googleapiclient.discovery import build
-    return build("drive", "v3", credentials=get_credentials(), cache_discovery=False)
+    from google_auth_httplib2 import AuthorizedHttp
+    import httplib2
+    timeout = float(os.getenv("GDRIVE_TIMEOUT", "120"))
+    return build("drive", "v3", http=AuthorizedHttp(get_credentials(), http=httplib2.Http(timeout=timeout)), cache_discovery=False)
 
 def list_files(client, root):
     folders, files = [root], []
@@ -35,12 +38,14 @@ def list_files(client, root):
 def version(item): return item.get("md5Checksum") or f"{item.get('modifiedTime', '')}:{item.get('size', '')}"
 def item_key(item): return hashlib.sha256(f"{item['id']}\0{version(item)}".encode()).hexdigest()
 def successful(path):
-    try: return json.loads(path.read_text(encoding="utf-8")).get("status") == "success"
+    try:
+        checkpoint = json.loads(path.read_text(encoding="utf-8"))
+        return checkpoint.get("status") in {"success", "skipped", "failed"} and checkpoint.get("format_version") == ARTIFACT_VERSION
     except (OSError, json.JSONDecodeError, AttributeError): return False
 
 def discover(folder, checkpoints, completed_keys=None):
     all_files = list_files(service(), folder_id(folder))
-    pending = [item for item in all_files if item["name"].lower().endswith(ARCHIVE_SUFFIXES) and (item_key(item) not in completed_keys if completed_keys is not None else not successful(checkpoints / "files" / f"{item_key(item)}.json"))]
+    pending = [item for item in all_files if item["name"].lower().endswith(ARCHIVE_SUFFIXES) and not successful(checkpoints / "files" / f"{item_key(item)}.json") and (completed_keys is None or item_key(item) not in completed_keys)]
     return pending, len(all_files)
 
 

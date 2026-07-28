@@ -2,7 +2,7 @@
 """Download, mutate, package, upload, and checkpoint each Drive archive."""
 from __future__ import annotations
 import random
-import argparse, base64, hashlib, json, filecmp, mimetypes, os, re, shutil, tarfile, tempfile, zipfile
+import argparse, base64, fcntl, hashlib, json, filecmp, mimetypes, os, re, shutil, tarfile, tempfile, zipfile
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 import requests
@@ -63,15 +63,61 @@ def jobs(root):
                 if isinstance(images, str): images = [images]
                 for context_index, context in enumerate(contexts if isinstance(contexts, list) else []):
                     if not isinstance(context, str) or not context.strip(): continue
-                    if not FIGURE_REFERENCE.search(context):
-                        skipped.append({"paper":paper.name,"asset_index":asset_index,"context_index":context_index,"reason":"Claim does not reference a figure"})
-                        continue
                     try:
                         resolved = [safe_path(paper, str(image)) for image in images]
                         if not resolved or any(not path.is_file() or path.suffix.lower() not in IMAGE_TYPES for path in resolved): raise ValueError("Missing or unsupported compiled image")
-                        found.append({"paper":paper.name,"metadata_file":metadata.name,"asset_index":asset_index,"context_index":context_index,"reference_context":context.strip(),"compiled_images":[str(path.relative_to(paper.resolve())) for path in resolved]})
+                        found.append({"paper":paper.name,"metadata_file":metadata.name,"asset_index":asset_index,"context_index":context_index,"reference_context":context.strip(),"figure_referenced":bool(FIGURE_REFERENCE.search(context)),"compiled_images":[str(path.relative_to(paper.resolve())) for path in resolved]})
                     except ValueError as exc: skipped.append({"paper":paper.name,"asset_index":asset_index,"context_index":context_index,"reason":str(exc)})
     return found, skipped
+
+def load_target_cache(entry):
+    try:
+        job = json.loads((entry / "target.json").read_text(encoding="utf-8"))
+        content = entry / "content"
+        if not isinstance(job, dict) or not job.get("figure_referenced"): return None
+        images = job.get("compiled_images")
+        if not isinstance(images, list) or not images: return None
+        if any(not safe_path(content / job["paper"], image).is_file() for image in images): return None
+        return job, content
+    except (OSError, ValueError, KeyError, json.JSONDecodeError, TypeError): return None
+
+def cache_target(root, job, entry):
+    """Persist the selected target and its images before any mutation attempt."""
+    content = entry / "content"
+    for image in job["compiled_images"]:
+        source = safe_path(root / job["paper"], image)
+        destination = safe_path(content / job["paper"], image)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    save(entry / "target.json", job)
+    return job, content
+
+def prepare_target(item, config):
+    """Cache one randomly selected target; never call the mutation model."""
+    log_file("cache-start", item)
+    load_env(Path(config["env"])); key = drive.item_key(item); entry = Path(config["target_cache"]) / key
+    if load_target_cache(entry):
+        log_file("cache-hit", item)
+        return True
+    temp_root = Path(config["temp_root"]); work = Path(tempfile.mkdtemp(prefix=f"cache-{key[:10]}-", dir=temp_root))
+    file_cp = Path(config["checkpoints"]) / "files" / f"{key}.json"
+    try:
+        bundle, extracted = work / "download.archive", work / "extracted"
+        drive.download_file(item, bundle); extract(bundle, extracted); root = paper_root(extracted); file_jobs, _ = jobs(root)
+        eligible_jobs = [job for job in file_jobs if job["figure_referenced"]]
+        if not eligible_jobs:
+            save(file_cp,{"status":"skipped","format_version":drive.ARTIFACT_VERSION,"drive_file":item,"claim_count":0,"reason":"No eligible figure-referencing claim"})
+            return False
+        cache_target(root, random.choice(eligible_jobs), entry)
+        log_file("cached", item)
+        return True
+    except Exception as exc:
+        try: save(file_cp,{"status":"failed","format_version":drive.ARTIFACT_VERSION,"drive_file":item,"error":str(exc)})
+        except Exception: pass
+        log_file("cache-error", item, f"error={json.dumps(str(exc))}")
+        return False
+    finally:
+        cleanup.delete_workdir(work,temp_root)
 
 def data_url(path):
     mime = IMAGE_TYPES.get(path.suffix.lower()) or mimetypes.guess_type(path.name)[0]
@@ -112,16 +158,21 @@ def output_name(name):
         if lowered.endswith(suffix): return name[:-len(suffix)] + ".zip"
     return name + ".zip"
 
-def build_artifact(path, root, records):
-    """Build a self-contained ZIP and return records whose image paths match it."""
+def build_artifact(path, root, records, source_key):
+    """Build a ZIP containing one JSONL claim stream and its referenced figures."""
     staging = path.parent / "artifact"
     refs = staging / "ref"
     refs.mkdir(parents=True, exist_ok=True)
     packaged = []
     copied = {}
     for record in records:
-        if not has_mutation(record): continue
-        archived = dict(record)
+        archived = {
+            "source_key":source_key,
+            "paper":record["paper"],
+            "metadata_file":record["metadata_file"],
+            "asset_index":record["asset_index"],
+            "context_index":record["context_index"],
+        }
         images = []
         paper = record.get("paper")
         for relative in record.get("compiled_images", []):
@@ -129,7 +180,7 @@ def build_artifact(path, root, records):
             relative_path = Path(relative)
             parts = relative_path.parts
             if parts and parts[0].lower() == "ref": relative_path = Path(*parts[1:])
-            destination = safe_path(refs, relative_path)
+            destination = safe_path(refs, Path(source_key) / paper / relative_path)
             destination.parent.mkdir(parents=True, exist_ok=True)
             if destination in copied:
                 if not filecmp.cmp(source, copied[destination], shallow=False):
@@ -138,45 +189,80 @@ def build_artifact(path, root, records):
                 shutil.copy2(source, destination)
                 copied[destination] = source
             images.append(destination.relative_to(staging).as_posix())
-        if images: archived["compiled_images"] = images
-        packaged.append(archived)
-    append_records(staging / "mutations.jsonl", packaged)
+        archived["references"] = images
+        packaged.append({"claim_type":"original","claim":record["reference_context"],**archived})
+        if has_mutation(record):
+            packaged.append({"claim_type":"mutated","claim":record["mutation"]["counterfactual_claim"],**archived})
+    append_records(staging / "dataset.jsonl", packaged)
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for entry in sorted(staging.rglob("*")):
             if entry.is_file(): archive.write(entry, entry.relative_to(staging))
     return packaged
+
+def merge_dataset(staging, output_dir, source_key, records):
+    """Idempotently merge one source into the shared dataset under a file lock."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dataset = output_dir / "dataset.jsonl"
+    with dataset.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            handle.seek(0)
+            for line in handle:
+                try: existing = json.loads(line)
+                except json.JSONDecodeError: continue
+                if existing.get("source_key") == source_key: return False
+            source_refs = staging / "ref" / source_key
+            if source_refs.is_dir(): shutil.copytree(source_refs, output_dir / "ref" / source_key, dirs_exist_ok=True)
+            handle.seek(0, os.SEEK_END)
+            for record in records: handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.flush(); os.fsync(handle.fileno())
+            return True
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
 def process_file(item, config):
     log_file("queue-exit", item, "worker-started")
     load_env(Path(config["env"])); key = drive.item_key(item); file_cp = Path(config["checkpoints"]) / "files" / f"{key}.json"
     temp_root = Path(config["temp_root"]); work = Path(tempfile.mkdtemp(prefix=f"claim-{key[:10]}-", dir=temp_root)); records = []
     try:
-        bundle, extracted = work / "download.archive", work / "extracted"
-        drive.download_file(item, bundle); extract(bundle, extracted); root = paper_root(extracted); file_jobs, skipped = jobs(root)
-        records.extend({"status":"skipped","drive_file":item,**entry} for entry in skipped)
+        cache_entry = Path(config["target_cache"]) / key
+        cached_target = load_target_cache(cache_entry)
+        if not cached_target: raise RuntimeError("Prepared target cache is missing or invalid")
+        mutation_target, root = cached_target
+        log_file("cache-hit", item)
         template = Path(config["prompt"]).read_text(encoding="utf-8")
-        for job in file_jobs:
-            material = "\0".join([key,job["paper"],job["metadata_file"],str(job["asset_index"]),str(job["context_index"]),job["reference_context"],*job["compiled_images"]]); job_id = hashlib.sha256(material.encode()).hexdigest(); job_cp = Path(config["checkpoints"]) / "jobs" / f"{job_id}.json"; base = {"drive_file":item,"job_id":job_id,**job,"difficulty":config["difficulty"]}
+        if mutation_target:
+            job = mutation_target
+            base = {"drive_file":item,**job,"difficulty":config["difficulty"]}
+            material = "\0".join([key,job["paper"],job["metadata_file"],str(job["asset_index"]),str(job["context_index"]),job["reference_context"],*job["compiled_images"]]); job_id = hashlib.sha256(material.encode()).hexdigest(); job_cp = Path(config["checkpoints"]) / "jobs" / f"{job_id}.json"; base["job_id"] = job_id
             if successful(job_cp):
                 cached = json.loads(job_cp.read_text(encoding="utf-8"))
                 records.append({**cached, "status":"checkpointed", "checkpoint_source":str(job_cp)})
-                continue
-            if config["dry_run"]: records.append({"status":"dry_run",**base}); continue
-            try:
+            elif config["dry_run"]: records.append({"status":"dry_run",**base})
+            else:
+              try:
                 prompt = template.replace("[TARGET_DIFFICULTY]",config["difficulty"]).replace("[INSERT FIGURE OR FIGURE DESCRIPTION]","The figure is attached as image input.").replace("[INSERT TRUE STATEMENT]",job["reference_context"])
                 record = {"status":"success",**base,"mutation":invoke(job,root/job["paper"],prompt,config)}
                 if not has_mutation(record): raise ValueError("Model returned no counterfactual claim")
                 save(job_cp,record)
-            except Exception as exc: record={"status":"skipped",**base,"reason":str(exc)}
-            records.append(record)
-        publishable = [record for record in records if has_mutation(record)]
-        if publishable and not config["dry_run"]:
+              except Exception as exc: record={"status":"skipped",**base,"mutation_error":str(exc)}
+              records.append(record)
+        output_records = [record for record in records if has_mutation(record)]
+        if output_records and not config["dry_run"]:
             artifact = work / output_name(item["name"])
-            packaged = build_artifact(artifact, root, publishable)
-            uploaded = drive.upload_file(artifact, config["output_folder"], artifact.name, key)
-            save(file_cp,{"status":"success","drive_file":item,"job_count":len(packaged),"output_file":uploaded})
+            packaged = build_artifact(artifact, root, output_records, key)
+            dataset = Path(config["output_dir"]) / "dataset.jsonl"
+            merge_dataset(work / "artifact", Path(config["output_dir"]), key, packaged)
+            checkpoint = {"status":"success","format_version":drive.ARTIFACT_VERSION,"drive_file":item,"claim_count":len(packaged),"local_output":str(dataset)}
+            if config["upload"]: checkpoint["output_file"] = drive.upload_file(artifact, config["output_folder"], artifact.name, key)
+            save(file_cp,checkpoint)
             records = packaged
+        elif not config["dry_run"]:
+            save(file_cp,{"status":"skipped","format_version":drive.ARTIFACT_VERSION,"drive_file":item,"claim_count":0,"reason":"No successful mutation"})
     except Exception as exc:
         records.append({"status":"error","drive_file":item,"error":str(exc)})
+        try: save(file_cp,{"status":"failed","format_version":drive.ARTIFACT_VERSION,"drive_file":item,"error":str(exc)})
+        except Exception: pass
         log_file("error", item, f"error={json.dumps(str(exc))}")
     finally:
         cleanup.delete_workdir(work,temp_root)
@@ -185,13 +271,28 @@ def process_file(item, config):
     return records
 
 def main():
-    parser=argparse.ArgumentParser(description=__doc__); parser.add_argument("folder",help="source Google Drive folder URL or ID"); parser.add_argument("output_folder",help="destination Google Drive folder URL or ID"); parser.add_argument("--workers",type=int,default=1); parser.add_argument("--temp-root",type=Path,default=Path(".work")); parser.add_argument("--checkpoint-dir",type=Path,default=Path("outputs/checkpoints")); parser.add_argument("--prompt",type=Path,default=Path("prompts/mutate_claim_text_figure_short.md")); parser.add_argument("--difficulty",choices=["Easy","Medium","Hard","Very hard"],default=DEFAULT_DIFFICULTY); parser.add_argument("--model",default=None); parser.add_argument("--endpoint",default=None); parser.add_argument("--timeout",type=float,default=120); parser.add_argument("--env",type=Path,default=Path(".env")); parser.add_argument("--dry-run",action="store_true"); args=parser.parse_args()
+    parser=argparse.ArgumentParser(description=__doc__); parser.add_argument("folder",help="source Google Drive folder URL or ID"); parser.add_argument("output_folder",nargs="?",help="destination Google Drive folder URL or ID (required with --upload)"); parser.add_argument("--workers",type=int,default=1); parser.add_argument("--temp-root",type=Path,default=Path(".work")); parser.add_argument("--checkpoint-dir",type=Path,default=Path(".checkpoints")); parser.add_argument("--target-cache",type=Path,default=Path(".target_cache")); parser.add_argument("--output-dir",type=Path,default=Path("outputs")); parser.add_argument("--prompt",type=Path,default=Path("prompts/mutate_claim_text_figure_short.md")); parser.add_argument("--difficulty",choices=["Easy","Medium","Hard","Very hard"],default=DEFAULT_DIFFICULTY); parser.add_argument("--model",default=None); parser.add_argument("--endpoint",default=None); parser.add_argument("--timeout",type=float,default=120,help="model API read timeout in seconds"); parser.add_argument("--drive-timeout",type=float,default=120,help="Google Drive socket timeout in seconds"); parser.add_argument("--env",type=Path,default=Path(".env")); parser.add_argument("--upload",action=argparse.BooleanOptionalAction,default=True); parser.add_argument("--dry-run",action="store_true"); args=parser.parse_args()
     if args.workers < 1: parser.error("--workers must be at least 1")
-    load_env(args.env); api_key=os.getenv("FPT_API_KEY")
+    if args.timeout <= 0 or args.drive_timeout <= 0: parser.error("timeouts must be positive")
+    if args.upload and not args.output_folder: parser.error("output_folder is required with --upload")
+    load_env(args.env); os.environ["GDRIVE_TIMEOUT"] = str(args.drive_timeout); api_key=os.getenv("FPT_API_KEY")
     if not args.dry_run and not api_key: parser.error("FPT_API_KEY is missing")
-    args.temp_root.mkdir(parents=True,exist_ok=True); completed_keys=drive.output_source_keys(args.output_folder); pending,scanned=drive.discover(args.folder,args.checkpoint_dir,completed_keys)
-    config={"env":str(args.env.resolve()),"temp_root":str(args.temp_root.resolve()),"checkpoints":str(args.checkpoint_dir.resolve()),"prompt":str(args.prompt.resolve()),"output_folder":args.output_folder,"difficulty":args.difficulty,"model":args.model or os.getenv("FPT_MODEL","Qwen2.5-VL-7B-Instruct"),"endpoint":args.endpoint or (os.getenv("FPT_BASE_URL","").rstrip("/")+"/chat/completions" if os.getenv("FPT_BASE_URL") else "https://mkp-api.fptcloud.com/chat/completions"),"timeout":args.timeout,"dry_run":args.dry_run,"api_key":api_key}
-    print(f"[pipeline] workers={args.workers} files_queued={len(pending)} files_at_once={min(args.workers, len(pending))} remote_completed={len(completed_keys)} output_folder={args.output_folder}", flush=True)
+    args.temp_root.mkdir(parents=True,exist_ok=True); completed_keys=drive.output_source_keys(args.output_folder) if args.upload else None; pending,scanned=drive.discover(args.folder,args.checkpoint_dir,completed_keys)
+    config={"env":str(args.env.resolve()),"temp_root":str(args.temp_root.resolve()),"checkpoints":str(args.checkpoint_dir.resolve()),"target_cache":str(args.target_cache.resolve()),"output_dir":str(args.output_dir.resolve()),"prompt":str(args.prompt.resolve()),"output_folder":args.output_folder,"upload":args.upload,"difficulty":args.difficulty,"model":args.model or os.getenv("FPT_MODEL","Qwen2.5-VL-7B-Instruct"),"endpoint":args.endpoint or (os.getenv("FPT_BASE_URL","").rstrip("/")+"/chat/completions" if os.getenv("FPT_BASE_URL") else "https://mkp-api.fptcloud.com/chat/completions"),"timeout":args.timeout,"dry_run":args.dry_run,"api_key":api_key}
+    print(f"[pipeline] workers={args.workers} files_queued={len(pending)} files_at_once={min(args.workers, len(pending))} upload={args.upload} remote_completed={len(completed_keys or ())} output_dir={args.output_dir}", flush=True)
+    print(f"[cache-phase] files={len(pending)} workers={args.workers}", flush=True)
+    if args.workers == 1:
+        prepared = [item for item in pending if prepare_target(item,config)]
+    else:
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            futures = {pool.submit(prepare_target,item,config):item for item in pending}
+            prepared = []
+            for future in futures:
+                try:
+                    if future.result(): prepared.append(futures[future])
+                except Exception as exc: log_file("cache-error",futures[future],f"error={json.dumps(str(exc))}")
+    pending = prepared
+    print(f"[mutation-phase] cached_files={len(pending)}; all target caching is complete", flush=True)
     results=[]
     if args.workers == 1:
         for item in pending:
@@ -216,5 +317,5 @@ def main():
                     except Exception as exc: batch = [{"status":"error","drive_file":item,"error":str(exc)}]
                     results.extend(batch)
                     submit_next()
-    errors=sum(record["status"]=="error" for record in results); print(f"Scanned {scanned}; pending {len(pending)}; workers {args.workers}; records {len(results)}; errors {errors}."); return 1 if errors else 0
+    errors=sum(record.get("status")=="error" for record in results); print(f"Scanned {scanned}; pending {len(pending)}; workers {args.workers}; records {len(results)}; errors {errors}."); return 1 if errors else 0
 if __name__ == "__main__": raise SystemExit(main())
