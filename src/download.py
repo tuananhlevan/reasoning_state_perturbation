@@ -6,6 +6,7 @@ from urllib.parse import parse_qs, urlparse
 from authenticate import get_credentials, load_env
 FOLDER_MIME = "application/vnd.google-apps.folder"
 ARCHIVE_SUFFIXES = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")
+ARTIFACT_VERSION = "2"
 
 def folder_id(value):
     parsed = urlparse(value); ids = parse_qs(parsed.query).get("id", [])
@@ -24,7 +25,7 @@ def list_files(client, root):
     while folders:
         parent, page = folders.pop(), None
         while True:
-            result = client.files().list(q=f"'{parent}' in parents and trashed = false", fields="nextPageToken,files(id,name,mimeType,modifiedTime,md5Checksum,size)", pageSize=1000, pageToken=page, supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+            result = client.files().list(q=f"'{parent}' in parents and trashed = false", fields="nextPageToken,files(id,name,mimeType,modifiedTime,md5Checksum,size,appProperties)", pageSize=1000, pageToken=page, supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
             for item in result.get("files", []):
                 folders.append(item["id"]) if item["mimeType"] == FOLDER_MIME else files.append(item)
             page = result.get("nextPageToken")
@@ -37,11 +38,22 @@ def successful(path):
     try: return json.loads(path.read_text(encoding="utf-8")).get("status") == "success"
     except (OSError, json.JSONDecodeError, AttributeError): return False
 
-def discover(folder, checkpoints):
+def discover(folder, checkpoints, completed_keys=None):
     all_files = list_files(service(), folder_id(folder))
-    pending = [item for item in all_files if item["name"].lower().endswith(ARCHIVE_SUFFIXES) and not successful(checkpoints / "files" / f"{item_key(item)}.json")]
+    pending = [item for item in all_files if item["name"].lower().endswith(ARCHIVE_SUFFIXES) and (item_key(item) not in completed_keys if completed_keys is not None else not successful(checkpoints / "files" / f"{item_key(item)}.json"))]
     return pending, len(all_files)
 
+
+def output_source_keys(folder):
+    """Return source-version keys already represented by destination artifacts."""
+    files = list_files(service(), folder_id(folder))
+    return {
+        item.get("appProperties", {}).get("sourceKey")
+        for item in files
+        if item["name"].lower().endswith(".zip")
+        and item.get("appProperties", {}).get("formatVersion") == ARTIFACT_VERSION
+        and item.get("appProperties", {}).get("sourceKey")
+    }
 def download_file(item, destination):
     from googleapiclient.http import MediaIoBaseDownload
     destination.parent.mkdir(parents=True, exist_ok=True); partial = destination.with_suffix(".part")
@@ -50,6 +62,32 @@ def download_file(item, destination):
         while not done: _, done = loader.next_chunk()
     if not partial.stat().st_size: raise ValueError(f"Empty download: {item['name']}")
     partial.replace(destination)
+
+def upload_file(source, destination_folder, name, source_key):
+    """Create or replace the artifact for one immutable source-file version."""
+    from googleapiclient.http import MediaFileUpload
+    client, parent = service(), folder_id(destination_folder)
+    escaped_key = source_key.replace("'", "\\'")
+    result = client.files().list(
+        q=f"'{parent}' in parents and trashed = false and appProperties has {{ key='sourceKey' and value='{escaped_key}' }}",
+        fields="files(id,name,webViewLink)", pageSize=10,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
+    matches = result.get("files", [])
+    media = MediaFileUpload(str(source), mimetype="application/zip", resumable=True)
+    body = {"name": name, "appProperties": {"sourceKey": source_key, "formatVersion": ARTIFACT_VERSION}}
+    if matches:
+        uploaded = client.files().update(
+            fileId=matches[0]["id"], body=body, media_body=media,
+            fields="id,name,webViewLink", supportsAllDrives=True,
+        ).execute()
+    else:
+        body["parents"] = [parent]
+        uploaded = client.files().create(
+            body=body, media_body=media, fields="id,name,webViewLink",
+            supportsAllDrives=True,
+        ).execute()
+    return uploaded
 
 def main():
     load_env(Path(".env"))

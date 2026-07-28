@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Run download -> mutate -> checkpoint -> delete for each Drive archive."""
+"""Download, mutate, package, upload, and checkpoint each Drive archive."""
 from __future__ import annotations
 import random
-import argparse, base64, hashlib, json, mimetypes, os, tarfile, tempfile, zipfile
+import argparse, base64, hashlib, json, filecmp, mimetypes, os, re, shutil, tarfile, tempfile, zipfile
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 import requests
@@ -11,6 +11,7 @@ import download as drive
 from authenticate import load_env
 
 IMAGE_TYPES = {".jpg":"image/jpeg", ".jpeg":"image/jpeg", ".png":"image/png", ".webp":"image/webp"}
+FIGURE_REFERENCE = re.compile(r"\bfig(?:ure)?s?\b", re.IGNORECASE)
 
 if random.randint(0, 1) < 0.33:
     DEFAULT_DIFFICULTY = "Easy"
@@ -62,6 +63,9 @@ def jobs(root):
                 if isinstance(images, str): images = [images]
                 for context_index, context in enumerate(contexts if isinstance(contexts, list) else []):
                     if not isinstance(context, str) or not context.strip(): continue
+                    if not FIGURE_REFERENCE.search(context):
+                        skipped.append({"paper":paper.name,"asset_index":asset_index,"context_index":context_index,"reason":"Claim does not reference a figure"})
+                        continue
                     try:
                         resolved = [safe_path(paper, str(image)) for image in images]
                         if not resolved or any(not path.is_file() or path.suffix.lower() not in IMAGE_TYPES for path in resolved): raise ValueError("Missing or unsupported compiled image")
@@ -83,8 +87,14 @@ def invoke(job, paper, prompt, config):
     return result
 
 def successful(path):
-    try: return json.loads(path.read_text(encoding="utf-8")).get("status") == "success"
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        return record.get("status") == "success" and has_mutation(record)
     except (OSError, json.JSONDecodeError, AttributeError): return False
+
+def has_mutation(record):
+    mutation = record.get("mutation")
+    return isinstance(mutation, dict) and isinstance(mutation.get("counterfactual_claim"), str) and bool(mutation["counterfactual_claim"].strip())
 
 def save(path, record):
     path.parent.mkdir(parents=True, exist_ok=True); temporary = path.with_suffix(f".{os.getpid()}.tmp"); temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2)+"\n", encoding="utf-8"); temporary.replace(path)
@@ -95,17 +105,54 @@ def append_records(path, records):
         for record in records:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+
+def output_name(name):
+    lowered = name.lower()
+    for suffix in sorted(drive.ARCHIVE_SUFFIXES, key=len, reverse=True):
+        if lowered.endswith(suffix): return name[:-len(suffix)] + ".zip"
+    return name + ".zip"
+
+def build_artifact(path, root, records):
+    """Build a self-contained ZIP and return records whose image paths match it."""
+    staging = path.parent / "artifact"
+    refs = staging / "ref"
+    refs.mkdir(parents=True, exist_ok=True)
+    packaged = []
+    copied = {}
+    for record in records:
+        if not has_mutation(record): continue
+        archived = dict(record)
+        images = []
+        paper = record.get("paper")
+        for relative in record.get("compiled_images", []):
+            source = safe_path(root / paper, relative)
+            relative_path = Path(relative)
+            parts = relative_path.parts
+            if parts and parts[0].lower() == "ref": relative_path = Path(*parts[1:])
+            destination = safe_path(refs, relative_path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination in copied:
+                if not filecmp.cmp(source, copied[destination], shallow=False):
+                    raise ValueError(f"Conflicting referenced image path: {destination.relative_to(staging)}")
+            else:
+                shutil.copy2(source, destination)
+                copied[destination] = source
+            images.append(destination.relative_to(staging).as_posix())
+        if images: archived["compiled_images"] = images
+        packaged.append(archived)
+    append_records(staging / "mutations.jsonl", packaged)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for entry in sorted(staging.rglob("*")):
+            if entry.is_file(): archive.write(entry, entry.relative_to(staging))
+    return packaged
 def process_file(item, config):
     log_file("queue-exit", item, "worker-started")
     load_env(Path(config["env"])); key = drive.item_key(item); file_cp = Path(config["checkpoints"]) / "files" / f"{key}.json"
-    if successful(file_cp):
-        log_file("complete", item, "status=file-checkpointed")
-        return [{"status":"file_checkpointed","drive_file":item}]
-    temp_root = Path(config["temp_root"]); work = Path(tempfile.mkdtemp(prefix=f"claim-{key[:10]}-", dir=temp_root)); records, all_ok = [], True
+    temp_root = Path(config["temp_root"]); work = Path(tempfile.mkdtemp(prefix=f"claim-{key[:10]}-", dir=temp_root)); records = []
     try:
         bundle, extracted = work / "download.archive", work / "extracted"
         drive.download_file(item, bundle); extract(bundle, extracted); root = paper_root(extracted); file_jobs, skipped = jobs(root)
-        records.extend({"status":"skipped","drive_file":item,**entry} for entry in skipped); all_ok = bool(file_jobs)
+        records.extend({"status":"skipped","drive_file":item,**entry} for entry in skipped)
         template = Path(config["prompt"]).read_text(encoding="utf-8")
         for job in file_jobs:
             material = "\0".join([key,job["paper"],job["metadata_file"],str(job["asset_index"]),str(job["context_index"]),job["reference_context"],*job["compiled_images"]]); job_id = hashlib.sha256(material.encode()).hexdigest(); job_cp = Path(config["checkpoints"]) / "jobs" / f"{job_id}.json"; base = {"drive_file":item,"job_id":job_id,**job,"difficulty":config["difficulty"]}
@@ -113,14 +160,24 @@ def process_file(item, config):
                 cached = json.loads(job_cp.read_text(encoding="utf-8"))
                 records.append({**cached, "status":"checkpointed", "checkpoint_source":str(job_cp)})
                 continue
-            if config["dry_run"]: all_ok=False; records.append({"status":"dry_run",**base}); continue
+            if config["dry_run"]: records.append({"status":"dry_run",**base}); continue
             try:
                 prompt = template.replace("[TARGET_DIFFICULTY]",config["difficulty"]).replace("[INSERT FIGURE OR FIGURE DESCRIPTION]","The figure is attached as image input.").replace("[INSERT TRUE STATEMENT]",job["reference_context"])
-                record = {"status":"success",**base,"mutation":invoke(job,root/job["paper"],prompt,config)}; save(job_cp,record)
-            except Exception as exc: all_ok=False; record={"status":"error",**base,"error":str(exc)}
+                record = {"status":"success",**base,"mutation":invoke(job,root/job["paper"],prompt,config)}
+                if not has_mutation(record): raise ValueError("Model returned no counterfactual claim")
+                save(job_cp,record)
+            except Exception as exc: record={"status":"skipped",**base,"reason":str(exc)}
             records.append(record)
-        if all_ok: save(file_cp,{"status":"success","drive_file":item,"job_count":len(file_jobs)})
-    except Exception as exc: records.append({"status":"error","drive_file":item,"error":str(exc)})
+        publishable = [record for record in records if has_mutation(record)]
+        if publishable and not config["dry_run"]:
+            artifact = work / output_name(item["name"])
+            packaged = build_artifact(artifact, root, publishable)
+            uploaded = drive.upload_file(artifact, config["output_folder"], artifact.name, key)
+            save(file_cp,{"status":"success","drive_file":item,"job_count":len(packaged),"output_file":uploaded})
+            records = packaged
+    except Exception as exc:
+        records.append({"status":"error","drive_file":item,"error":str(exc)})
+        log_file("error", item, f"error={json.dumps(str(exc))}")
     finally:
         cleanup.delete_workdir(work,temp_root)
         status = "error" if any(record.get("status") == "error" for record in records) else ("dry-run" if config["dry_run"] else "success")
@@ -128,18 +185,18 @@ def process_file(item, config):
     return records
 
 def main():
-    parser=argparse.ArgumentParser(description=__doc__); parser.add_argument("folder"); parser.add_argument("--workers",type=int,default=1); parser.add_argument("--temp-root",type=Path,default=Path(".work")); parser.add_argument("--checkpoint-dir",type=Path,default=Path("outputs/checkpoints")); parser.add_argument("--prompt",type=Path,default=Path("prompts/short.md")); parser.add_argument("--output",type=Path,default=Path("outputs/mutations.jsonl")); parser.add_argument("--difficulty",choices=["Easy","Medium","Hard","Very hard"],default=DEFAULT_DIFFICULTY); parser.add_argument("--model",default=None); parser.add_argument("--endpoint",default=None); parser.add_argument("--timeout",type=float,default=120); parser.add_argument("--env",type=Path,default=Path(".env")); parser.add_argument("--dry-run",action="store_true"); args=parser.parse_args()
+    parser=argparse.ArgumentParser(description=__doc__); parser.add_argument("folder",help="source Google Drive folder URL or ID"); parser.add_argument("output_folder",help="destination Google Drive folder URL or ID"); parser.add_argument("--workers",type=int,default=1); parser.add_argument("--temp-root",type=Path,default=Path(".work")); parser.add_argument("--checkpoint-dir",type=Path,default=Path("outputs/checkpoints")); parser.add_argument("--prompt",type=Path,default=Path("prompts/mutate_claim_text_figure_short.md")); parser.add_argument("--difficulty",choices=["Easy","Medium","Hard","Very hard"],default=DEFAULT_DIFFICULTY); parser.add_argument("--model",default=None); parser.add_argument("--endpoint",default=None); parser.add_argument("--timeout",type=float,default=120); parser.add_argument("--env",type=Path,default=Path(".env")); parser.add_argument("--dry-run",action="store_true"); args=parser.parse_args()
     if args.workers < 1: parser.error("--workers must be at least 1")
     load_env(args.env); api_key=os.getenv("FPT_API_KEY")
     if not args.dry_run and not api_key: parser.error("FPT_API_KEY is missing")
-    args.temp_root.mkdir(parents=True,exist_ok=True); pending,scanned=drive.discover(args.folder,args.checkpoint_dir)
-    config={"env":str(args.env.resolve()),"temp_root":str(args.temp_root.resolve()),"checkpoints":str(args.checkpoint_dir.resolve()),"prompt":str(args.prompt.resolve()),"difficulty":args.difficulty,"model":args.model or os.getenv("FPT_MODEL","Qwen2.5-VL-7B-Instruct"),"endpoint":args.endpoint or (os.getenv("FPT_BASE_URL","").rstrip("/")+"/chat/completions" if os.getenv("FPT_BASE_URL") else "https://mkp-api.fptcloud.com/chat/completions"),"timeout":args.timeout,"dry_run":args.dry_run,"api_key":api_key}
-    print(f"[pipeline] workers={args.workers} files_queued={len(pending)} files_at_once={min(args.workers, len(pending))} output={args.output}", flush=True)
+    args.temp_root.mkdir(parents=True,exist_ok=True); completed_keys=drive.output_source_keys(args.output_folder); pending,scanned=drive.discover(args.folder,args.checkpoint_dir,completed_keys)
+    config={"env":str(args.env.resolve()),"temp_root":str(args.temp_root.resolve()),"checkpoints":str(args.checkpoint_dir.resolve()),"prompt":str(args.prompt.resolve()),"output_folder":args.output_folder,"difficulty":args.difficulty,"model":args.model or os.getenv("FPT_MODEL","Qwen2.5-VL-7B-Instruct"),"endpoint":args.endpoint or (os.getenv("FPT_BASE_URL","").rstrip("/")+"/chat/completions" if os.getenv("FPT_BASE_URL") else "https://mkp-api.fptcloud.com/chat/completions"),"timeout":args.timeout,"dry_run":args.dry_run,"api_key":api_key}
+    print(f"[pipeline] workers={args.workers} files_queued={len(pending)} files_at_once={min(args.workers, len(pending))} remote_completed={len(completed_keys)} output_folder={args.output_folder}", flush=True)
     results=[]
     if args.workers == 1:
         for item in pending:
             log_file("queue-enter", item)
-            batch = process_file(item,config); append_records(args.output,batch); results.extend(batch)
+            batch = process_file(item,config); results.extend(batch)
     else:
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
             iterator, futures = iter(pending), {}
@@ -157,7 +214,7 @@ def main():
                     item = futures.pop(future)
                     try: batch = future.result()
                     except Exception as exc: batch = [{"status":"error","drive_file":item,"error":str(exc)}]
-                    append_records(args.output,batch); results.extend(batch)
+                    results.extend(batch)
                     submit_next()
     errors=sum(record["status"]=="error" for record in results); print(f"Scanned {scanned}; pending {len(pending)}; workers {args.workers}; records {len(results)}; errors {errors}."); return 1 if errors else 0
 if __name__ == "__main__": raise SystemExit(main())

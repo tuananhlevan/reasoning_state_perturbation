@@ -4,4 +4,7 @@ source "$HOME/miniconda3/etc/profile.d/conda.sh" 2>/dev/null || source "$HOME/an
 conda activate mutate
 
 python3 src/authenticate.py
-python3 src/mutate.py 'https://drive.google.com/drive/folders/1fkSXw03MJEU_1Hs2uRZKDi2b8_KBGVgL' --workers "${WORKERS:-1}"
+
+INPUT_FOLDER='https://drive.google.com/drive/folders/1Qy1xSCtwQvO-5LBru36lixLZU8zlyiOH'
+OUTPUT_FOLDER='https://drive.google.com/drive/folders/1NrwjxBunPMtiK8Z-v1Lh40ctdmEymrtF'
+python3 src/mutate.py "$INPUT_FOLDER" "$OUTPUT_FOLDER" --workers "${WORKERS:-1}"
