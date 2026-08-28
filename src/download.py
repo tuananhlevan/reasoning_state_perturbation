@@ -6,7 +6,7 @@ from urllib.parse import parse_qs, urlparse
 from authenticate import get_credentials, load_env
 FOLDER_MIME = "application/vnd.google-apps.folder"
 ARCHIVE_SUFFIXES = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")
-ARTIFACT_VERSION = "4"
+ARTIFACT_VERSION = "6"
 
 def folder_id(value):
     parsed = urlparse(value); ids = parse_qs(parsed.query).get("id", [])

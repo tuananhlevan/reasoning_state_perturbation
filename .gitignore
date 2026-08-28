@@ -7,7 +7,10 @@ __pycache__
 .env
 test/
 .vscode
-prompts/
+prompts/*
+!prompts/claim_text.md
+!prompts/claim_text_fig.md
 outputs/
 credentials.json
 .work/
+related_data
